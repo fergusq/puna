@@ -1,0 +1,51 @@
+name:                puna
+version:             0.1.0.0
+github:              "fergusq/puna"
+license:             GPL-3
+author:              "Iikka Hauhio"
+maintainer:          "fergusq@kaivos.org"
+copyright:           "2018 Iikka Hauhio"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/fergusq/puna#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- mtl
+- transformers
+- containers
+
+library:
+  source-dirs: src
+
+executables:
+  puna-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - puna
+
+tests:
+  puna-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - puna
