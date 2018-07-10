@@ -24,6 +24,7 @@ dependencies:
 - mtl
 - transformers
 - containers
+- regex-compat
 
 library:
   source-dirs: src

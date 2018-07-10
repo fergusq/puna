@@ -5,7 +5,6 @@ import Data.Either
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans.Class
-import Control.Monad.State
 
 -- | ParsingError contains strings representing the expected and actual values of the erronous token alongside with its line and column numbers
 

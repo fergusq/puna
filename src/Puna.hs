@@ -5,12 +5,14 @@ import System.IO (isEOF)
 import Control.Applicative
 import Control.Monad.Trans.Class
 import Control.Monad.Identity
+import Control.Monad.State
 
 import Coroutine
 import Parser
 
 import Data.Maybe
 import qualified Data.Map as M
+import Text.Regex
 
 -- | Prelexer converts a list of characters to a list of 'LNToken Char'
 
@@ -26,7 +28,7 @@ prelex' (c   :cs) l k = LNToken c    l k : prelex' cs l     (k+1)
 type TParser r = ParserT (LNToken Char) Identity r
 
 tokenp :: TParser (LNToken String)
-tokenp = identifier <|> acceptL "->" <|> acceptL "=>" <|> regexp <|> quotep <|> (((:"")<$>) <$> oneOfL "=()|.,;$:")
+tokenp = lnToken (some (oneOfL "0123456789")) <|> identifier <|> acceptL "->" <|> acceptL "=>" <|> regexp <|> quotep <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#")
 
 quotep :: TParser (LNToken String)
 quotep = acceptL "\"" *>
@@ -46,19 +48,20 @@ tokensp eof = many (many space *> tokenp) <* many space <* acceptL eof
 data PExpr
     = PIdent String
     | PString String
+    | PInteger Integer
     | PCall String [PExpr]
     | PPipe PExpr PExpr
     | PFor [(PPattern, PExpr)]
     | PPull [(PPattern, PExpr)]
     | PLet PPattern PExpr PExpr
     | PBlock [PExpr]
-    deriving (Show)
 
 data PPattern
     = PPVar String PPattern
     | PPString String
+    | PPRegex Regex
     | PPAnyString
-    deriving (Show)
+    | PPAnyInt
 
 type PParser r = ParserT (LNToken String) Identity r
 
@@ -71,9 +74,12 @@ expressionp = do e <- pipep
                  return $ PBlock (e:es)
 
 pipep :: PParser PExpr
-pipep = do e <- callp <|> forp <|> pullp <|> letp <|> identp <|> parentp <|> stringp
-           es <- many (acceptL ["|"] *> pipep)
+pipep = do e <- simplep
+           es <- many (acceptL ["|"] *> simplep)
            return $ foldl PPipe e es
+
+simplep :: PParser PExpr
+simplep = callp <|> forp <|> pullp <|> letp <|> identp <|> parentp <|> stringp
 
 identp :: PParser PExpr
 identp = PIdent <$> identifierL
@@ -83,6 +89,12 @@ stringp = do s <- nextToken
              unless ((content s !! 0) == '\"') $
                  parsingError s "string token"
              return . PString $ drop 1 (content s)
+
+intp :: PParser PExpr
+intp = do s <- nextToken
+          unless (all (`elem` "0123456789") (content s)) $
+              parsingError s "int token"
+          return . PInteger . read $ content s
 
 callp :: PParser PExpr
 callp = PCall <$> identifierL <*> (acceptL ["("] *> argumentsp) <* acceptL [")"]
@@ -94,16 +106,16 @@ argumentsp = (do a <- expressionp
            <|> nothing
 
 forp :: PParser PExpr
-forp = PFor <$> some ((,) <$> patternp <*> (acceptL ["=>"] *> expressionp))
+forp = PFor <$> some ((,) <$> patternp <*> (acceptL ["=>"] *> simplep))
 
 pullp :: PParser PExpr
-pullp = PPull <$> some ((,) <$> patternp <*> (acceptL ["->"] *> expressionp))
+pullp = PPull <$> some ((,) <$> patternp <*> (acceptL ["->"] *> simplep))
 
 letp :: PParser PExpr
 letp = PLet <$> patternp <*> (acceptL ["="] *> pipep) <*> (acceptL [";"] *> expressionp)
 
 patternp :: PParser PPattern
-patternp = varpp <|> stringpp <|> anystringpp
+patternp = varpp <|> stringpp <|> anystringpp <|> regexpp <|> anyintpp
 
 varpp :: PParser PPattern
 varpp = PPVar <$> identifierL <*> patternp
@@ -114,6 +126,15 @@ stringpp = do (PString s) <- stringp
 
 anystringpp :: PParser PPattern
 anystringpp = acceptL ["$"] >> return PPAnyString
+
+regexpp :: PParser PPattern
+regexpp = do s <- nextToken
+             unless ((content s !! 0) == '/') $
+                 parsingError s "regex token"
+             return . PPRegex . mkRegex $ drop 1 (content s)
+
+anyintpp :: PParser PPattern
+anyintpp = acceptL ["#"] >> return PPAnyInt
 
 parentp :: PParser PExpr
 parentp = (acceptL ["("] *> expressionp) <* acceptL [")"]
@@ -134,7 +155,12 @@ parsePuna code = do tokens <- lexPuna code
 
 -- Compiler
 
-type PunaValue = String
+data PunaValue = PVStr String | PVInt Integer
+
+toString :: PunaValue -> String
+toString (PVStr s) = s
+toString (PVInt i) = show i
+
 type PunaScope = M.Map String PunaValue
 
 type PunaFunc = PunaScope -> StreamT PunaValue IO ()
@@ -143,8 +169,9 @@ eval :: PunaFunc -> PunaScope -> (PunaValue -> StreamT PunaValue IO ()) -> Strea
 eval f scope g = pipePipe [f scope, pullPipe >>= \(Just v) -> g v]
 
 compile :: PExpr -> PunaFunc
-compile (PString string) scope = pushPipe string
-compile (PIdent ident)   scope = pushPipe . fromJust $ M.lookup ident scope <|> Just ""
+compile (PString string) scope = pushPipe $ PVStr string
+compile (PInteger int)   scope = pushPipe $ PVInt int
+compile (PIdent ident)   scope = pushPipe . fromJust $ M.lookup ident scope <|> Just (PVStr "")
 compile (PPipe e1 e2)    scope = pipePipe [compile e1 scope, compile e2 scope]
 
 compile (PFor []) scope = return ()
@@ -176,20 +203,38 @@ compile (PBlock exprs) scope
 
 compile (PCall "add" [a, b]) scope = eval (compile a) scope $ \x ->
                                      eval (compile b) scope $ \y ->
-                                     pushPipe (x++y)
+                                     let x' = toString x
+                                         y' = toString y
+                                     in pushPipe $ PVStr (x'++y')
 compile (PCall f as)         scope = error ("unknown function " ++ f)
 
 -- Pattern
 
 patternToInserts :: PPattern -> PunaValue -> Maybe [PunaScope -> PunaScope]
-patternToInserts (PPVar v p) e = do inserts <- patternToInserts p e
-                                    return [M.insert v e]
+patternToInserts = pti'
 
-patternToInserts (PPString s) e = if s == e then Just [] else Nothing
--- patternToInserts (PPString _) _ = Nothing
+pti' :: PPattern -> PunaValue -> Maybe [PunaScope -> PunaScope]
 
-patternToInserts PPAnyString _ = Just []
--- patternToInserts PPAnyString _ = Nothing
+-- ppvar
+pti' (PPVar v p) e = do inserts <- pti' p e
+                        return (M.insert v e : inserts)
+
+-- ppstring
+pti' (PPString s) (PVStr e) = if s == e then Just [] else Nothing
+pti' (PPString _) _         = Nothing
+
+-- ppanystring
+pti' PPAnyString (PVStr _) = Just []
+pti' PPAnyString _         = Nothing
+
+-- ppregex
+pti' (PPRegex p) (PVStr e) = do groups <- matchRegex p e
+                                return . map (\(i, g) -> M.insert ('\'':show i) (PVStr g)) $ zip [(1::Int)..] groups
+pti' (PPRegex _) _         = Nothing
+
+-- ppanyint
+pti' PPAnyInt (PVInt _) = Just []
+pti' PPAnyInt _         = Nothing
 
 -- Runtime
 
@@ -197,19 +242,19 @@ inputStream :: CoroutineT PunaValue IO ()
 inputStream = do done <- lift isEOF
                  unless done $ do
                      line <- lift getLine
-                     push line
+                     push $ PVStr line
                      inputStream
 
 outputStream :: CoroutineT PunaValue IO () -> IO ()
 outputStream input = do p <- pull input
                         case p of
-                            Just (s, l) -> do putStrLn s
+                            Just (s, l) -> do putStrLn $ toString s
                                               outputStream l
                             Nothing -> return ()
 
 runProgram :: String -> IO ()
 runProgram code = case program of
-                      Left error -> print error
+                      Left error -> forM_ error $ \msg -> print msg
                       Right io -> io
     where
         program = do expr <- parsePuna code
