@@ -11,6 +11,7 @@ import Coroutine
 import Parser
 
 import Data.Maybe
+import Data.List
 import qualified Data.Map as M
 import Text.Regex
 
@@ -28,7 +29,7 @@ prelex' (c   :cs) l k = LNToken c    l k : prelex' cs l     (k+1)
 type TParser r = ParserT (LNToken Char) Identity r
 
 tokenp :: TParser (LNToken String)
-tokenp = lnToken (some (oneOfL "0123456789")) <|> identifier <|> acceptL "->" <|> acceptL "=>" <|> regexp <|> quotep <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#")
+tokenp = lnToken (some (oneOfL "0123456789")) <|> identifier <|> acceptL "->" <|> acceptL "=>" <|> acceptL ".." <|> regexp <|> quotep <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#+*")
 
 quotep :: TParser (LNToken String)
 quotep = acceptL "\"" *>
@@ -55,6 +56,19 @@ data PExpr
     | PPull [(PPattern, PExpr)]
     | PLet PPattern PExpr PExpr
     | PBlock [PExpr]
+    | PEmpty
+
+instance Show PExpr where
+    show (PIdent s) = s
+    show (PString s) = show s
+    show (PInteger i) = show i
+    show (PCall s es) = s ++ "(" ++ intercalate ", " (map show es) ++ ")"
+    show (PPipe a b) = show a ++ " | " ++ show b
+    show (PFor ps) = intercalate " " $ map (\(p, e) -> show p ++ " => (" ++ show e ++ ")") ps
+    show (PPull ps) = intercalate " " $ map (\(p, e) -> show p ++ " -> (" ++ show e ++ ")") ps
+    show (PLet pp a b) = show pp ++ " = " ++ show a ++ "; " ++ show b
+    show (PBlock es) = intercalate "; " $ map show es
+    show PEmpty = "()"
 
 data PPattern
     = PPVar String PPattern
@@ -62,6 +76,13 @@ data PPattern
     | PPRegex Regex
     | PPAnyString
     | PPAnyInt
+
+instance Show PPattern where
+    show (PPVar s pp) = s ++ " " ++ show pp
+    show (PPString s) = show s
+    show (PPRegex s) = ":/../"
+    show PPAnyString = "$"
+    show PPAnyInt = "#"
 
 type PParser r = ParserT (LNToken String) Identity r
 
@@ -74,12 +95,27 @@ expressionp = do e <- pipep
                  return $ PBlock (e:es)
 
 pipep :: PParser PExpr
-pipep = do e <- simplep
-           es <- many (acceptL ["|"] *> simplep)
+pipep = do e <- concatp
+           es <- many (acceptL ["|"] *> concatp)
            return $ foldl PPipe e es
 
+concatp :: PParser PExpr
+concatp = do e <- termp
+             es <- many (acceptL [".."] *> termp)
+             return $ foldl (\a b -> PCall ".." [a, b]) e es
+
+termp :: PParser PExpr
+termp = do e <- factorp
+           es <- many (acceptL ["+"] *> factorp)
+           return $ foldl (\a b -> PCall "+" [a, b]) e es
+
+factorp :: PParser PExpr
+factorp = do e <- simplep
+             es <- many (acceptL ["*"] *> simplep)
+             return $ foldl (\a b -> PCall "*" [a, b]) e es
+
 simplep :: PParser PExpr
-simplep = callp <|> forp <|> pullp <|> letp <|> identp <|> parentp <|> stringp
+simplep = callp <|> forp <|> pullp <|> letp <|> intp <|> identp <|> parentp <|> stringp <|> emptyp
 
 identp :: PParser PExpr
 identp = PIdent <$> identifierL
@@ -105,11 +141,17 @@ argumentsp = (do a <- expressionp
                  return (a:as))
            <|> nothing
 
+parentp :: PParser PExpr
+parentp = (acceptL ["("] *> expressionp) <* acceptL [")"]
+
+emptyp :: PParser PExpr
+emptyp = acceptL ["(", ")"] >> return PEmpty
+
 forp :: PParser PExpr
-forp = PFor <$> some ((,) <$> patternp <*> (acceptL ["=>"] *> simplep))
+forp = PFor <$> some ((,) <$> patternp <*> (acceptL ["=>"] *> concatp))
 
 pullp :: PParser PExpr
-pullp = PPull <$> some ((,) <$> patternp <*> (acceptL ["->"] *> simplep))
+pullp = PPull <$> some ((,) <$> patternp <*> (acceptL ["->"] *> concatp))
 
 letp :: PParser PExpr
 letp = PLet <$> patternp <*> (acceptL ["="] *> pipep) <*> (acceptL [";"] *> expressionp)
@@ -136,9 +178,6 @@ regexpp = do s <- nextToken
 anyintpp :: PParser PPattern
 anyintpp = acceptL ["#"] >> return PPAnyInt
 
-parentp :: PParser PExpr
-parentp = (acceptL ["("] *> expressionp) <* acceptL [")"]
-
 -- Parser function
 
 lexPuna :: String -> Either [ParsingError] [LNToken String]
@@ -161,14 +200,20 @@ toString :: PunaValue -> String
 toString (PVStr s) = s
 toString (PVInt i) = show i
 
+toInt :: PunaValue -> Integer
+toInt (PVStr s) = read s
+toInt (PVInt i) = i
+
 type PunaScope = M.Map String PunaValue
 
 type PunaFunc = PunaScope -> StreamT PunaValue IO ()
 
-eval :: PunaFunc -> PunaScope -> (PunaValue -> StreamT PunaValue IO ()) -> StreamT PunaValue IO ()
-eval f scope g = pipePipe [f scope, pullPipe >>= \(Just v) -> g v]
+eval :: PExpr -> PunaScope -> (PunaValue -> StreamT PunaValue IO ()) -> StreamT PunaValue IO ()
+eval expr scope g = pipePipe [compile expr scope, pullPipe >>= \v -> case v of Just v' -> g v'
+                                                                               Nothing -> error $ show expr ++ " evaluated to nothing" ]
 
 compile :: PExpr -> PunaFunc
+compile PEmpty           scope = return ()
 compile (PString string) scope = pushPipe $ PVStr string
 compile (PInteger int)   scope = pushPipe $ PVInt int
 compile (PIdent ident)   scope = pushPipe . fromJust $ M.lookup ident scope <|> Just (PVStr "")
@@ -193,7 +238,7 @@ compile (PPull ((pattern, expr):ps)) scope
              Nothing -> compile (PFor ps) scope
 
 compile (PLet pattern val expr) scope
-    = eval (compile val) scope $ \v ->
+    = eval val scope $ \v ->
       let (Just is) = patternToInserts pattern v
       in compile expr (foldr ($) scope is)
 
@@ -201,12 +246,24 @@ compile (PBlock exprs) scope
     = let (v:vs) = ($ scope) <$> map compile exprs
       in foldr (>>) v vs
 
-compile (PCall "add" [a, b]) scope = eval (compile a) scope $ \x ->
-                                     eval (compile b) scope $ \y ->
-                                     let x' = toString x
-                                         y' = toString y
-                                     in pushPipe $ PVStr (x'++y')
+compile (PCall ".." [a, b]) scope = binaryOp scope a b $ \x y ->
+                                    let x' = toString x
+                                        y' = toString y
+                                    in pushPipe $ PVStr (x'++y')
+compile (PCall "+" [a, b]) scope = binaryOp scope a b $ \x y ->
+                                   let x' = toInt x
+                                       y' = toInt y
+                                   in pushPipe $ PVInt (x'+y')
+compile (PCall "*" [a, b]) scope = binaryOp scope a b $ \x y ->
+                                   let x' = toInt x
+                                       y' = toInt y
+                                   in pushPipe $ PVInt (x'*y')
 compile (PCall f as)         scope = error ("unknown function " ++ f)
+
+binaryOp :: PunaScope -> PExpr -> PExpr -> (PunaValue -> PunaValue -> StreamT PunaValue IO ()) -> StreamT PunaValue IO ()
+binaryOp scope a b f = eval a scope $ \x ->
+                       eval b scope $ \y ->
+                       f x y
 
 -- Pattern
 
