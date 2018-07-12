@@ -29,7 +29,14 @@ prelex' (c   :cs) l k = LNToken c    l k : prelex' cs l     (k+1)
 type TParser r = ParserT (LNToken Char) Identity r
 
 tokenp :: TParser (LNToken String)
-tokenp = lnToken (some (oneOfL "0123456789")) <|> identifier <|> acceptL "->" <|> acceptL "=>" <|> acceptL ".." <|> regexp <|> quotep <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#+*")
+tokenp = lnToken (some (oneOfL "0123456789"))
+       <|> identifier
+       <|> acceptL "->"
+       <|> acceptL "=>"
+       <|> acceptL ".."
+       <|> regexp
+       <|> quotep
+       <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#+-*/")
 
 quotep :: TParser (LNToken String)
 quotep = acceptL "\"" *>
@@ -76,6 +83,7 @@ data PPattern
     | PPRegex Regex
     | PPAnyString
     | PPAnyInt
+    | PPAny
 
 instance Show PPattern where
     show (PPVar s pp) = s ++ " " ++ show pp
@@ -83,6 +91,7 @@ instance Show PPattern where
     show (PPRegex s) = ":/../"
     show PPAnyString = "$"
     show PPAnyInt = "#"
+    show PPAny = ""
 
 type PParser r = ParserT (LNToken String) Identity r
 
@@ -95,27 +104,30 @@ expressionp = do e <- pipep
                  return $ PBlock (e:es)
 
 pipep :: PParser PExpr
-pipep = do e <- concatp
-           es <- many (acceptL ["|"] *> concatp)
+pipep = do e <- firstp
+           es <- many (acceptL ["|"] *> firstp)
            return $ foldl PPipe e es
 
+operatorp :: [String] -> PParser PExpr -> PParser PExpr
+operatorp ops subp = do e <- subp
+                        es <- many (do op <- oneOfL ops
+                                       e' <- subp
+                                       return (content op, e'))
+                        return $ foldl (\a (op, b) -> PCall op [a, b]) e es
+
+firstp = concatp
+
 concatp :: PParser PExpr
-concatp = do e <- termp
-             es <- many (acceptL [".."] *> termp)
-             return $ foldl (\a b -> PCall ".." [a, b]) e es
+concatp = operatorp [".."] termp
 
 termp :: PParser PExpr
-termp = do e <- factorp
-           es <- many (acceptL ["+"] *> factorp)
-           return $ foldl (\a b -> PCall "+" [a, b]) e es
+termp = operatorp ["+", "-"] factorp
 
 factorp :: PParser PExpr
-factorp = do e <- simplep
-             es <- many (acceptL ["*"] *> simplep)
-             return $ foldl (\a b -> PCall "*" [a, b]) e es
+factorp = operatorp ["*", "/"] simplep
 
 simplep :: PParser PExpr
-simplep = callp <|> forp <|> pullp <|> letp <|> intp <|> identp <|> parentp <|> stringp <|> emptyp
+simplep = callp <|> forp <|> pullp <|> letp <|> intp <|> identp <|> parentp <|> stringp <|> emptyp <|> lenp
 
 identp :: PParser PExpr
 identp = PIdent <$> identifierL
@@ -131,6 +143,9 @@ intp = do s <- nextToken
           unless (all (`elem` "0123456789") (content s)) $
               parsingError s "int token"
           return . PInteger . read $ content s
+
+lenp :: PParser PExpr
+lenp = PCall "#" . pure <$> (acceptL ["#"] *> simplep)
 
 callp :: PParser PExpr
 callp = PCall <$> identifierL <*> (acceptL ["("] *> argumentsp) <* acceptL [")"]
@@ -157,10 +172,10 @@ letp :: PParser PExpr
 letp = PLet <$> patternp <*> (acceptL ["="] *> pipep) <*> (acceptL [";"] *> expressionp)
 
 patternp :: PParser PPattern
-patternp = varpp <|> stringpp <|> anystringpp <|> regexpp <|> anyintpp
+patternp = varpp <|> stringpp <|> anystringpp <|> regexpp <|> anyintpp <|> parentpp <|> anypp
 
 varpp :: PParser PPattern
-varpp = PPVar <$> identifierL <*> patternp
+varpp = PPVar <$> identifierL <*> (patternp <|> return PPAny)
 
 stringpp :: PParser PPattern
 stringpp = do (PString s) <- stringp
@@ -177,6 +192,12 @@ regexpp = do s <- nextToken
 
 anyintpp :: PParser PPattern
 anyintpp = acceptL ["#"] >> return PPAnyInt
+
+anypp :: PParser PPattern
+anypp = acceptL ["(", ")"] >> return PPAny
+
+parentpp :: PParser PPattern
+parentpp = (acceptL ["("] *> patternp) <* acceptL [")"]
 
 -- Parser function
 
@@ -246,24 +267,24 @@ compile (PBlock exprs) scope
     = let (v:vs) = ($ scope) <$> map compile exprs
       in foldr (>>) v vs
 
-compile (PCall ".." [a, b]) scope = binaryOp scope a b $ \x y ->
-                                    let x' = toString x
-                                        y' = toString y
-                                    in pushPipe $ PVStr (x'++y')
-compile (PCall "+" [a, b]) scope = binaryOp scope a b $ \x y ->
-                                   let x' = toInt x
-                                       y' = toInt y
-                                   in pushPipe $ PVInt (x'+y')
-compile (PCall "*" [a, b]) scope = binaryOp scope a b $ \x y ->
-                                   let x' = toInt x
-                                       y' = toInt y
-                                   in pushPipe $ PVInt (x'*y')
-compile (PCall f as)         scope = error ("unknown function " ++ f)
+compile (PCall ".." [a, b]) scope = binaryPvOp scope a b toString PVStr (++)
+compile (PCall "+" [a, b])  scope = binaryPvOp scope a b toInt PVInt (+)
+compile (PCall "-" [a, b])  scope = binaryPvOp scope a b toInt PVInt (-)
+compile (PCall "*" [a, b])  scope = binaryPvOp scope a b toInt PVInt (*)
+compile (PCall "/" [a, b])  scope = binaryPvOp scope a b toInt PVInt div
+compile (PCall "#" [a])     scope = eval a scope $ \x -> pushPipe . PVInt . toInteger . length . toString $ x
+compile (PCall f as)        scope = error ("unknown function " ++ f)
 
 binaryOp :: PunaScope -> PExpr -> PExpr -> (PunaValue -> PunaValue -> StreamT PunaValue IO ()) -> StreamT PunaValue IO ()
 binaryOp scope a b f = eval a scope $ \x ->
                        eval b scope $ \y ->
                        f x y
+
+binaryPvOp :: PunaScope -> PExpr -> PExpr -> (PunaValue -> t) -> (t -> PunaValue) -> (t -> t -> t) -> StreamT PunaValue IO ()
+binaryPvOp scope a b t c f = binaryOp scope a b $ \x y ->
+                             let x' = t x
+                                 y' = t y
+                             in pushPipe . c $ f x' y'
 
 -- Pattern
 
@@ -292,6 +313,9 @@ pti' (PPRegex _) _         = Nothing
 -- ppanyint
 pti' PPAnyInt (PVInt _) = Just []
 pti' PPAnyInt _         = Nothing
+
+-- ppany
+pti' PPAny _ = Just []
 
 -- Runtime
 
