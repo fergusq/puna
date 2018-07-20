@@ -45,6 +45,11 @@ pull (Yield x k) = return $ Just (x, k)
 pull (YieldT i) = do k <- i
                      pull k
 
+pullAll :: (Monad m) => CoroutineT s m r -> m [s]
+pullAll (Return _)  = return []
+pullAll (Yield v f) = pullAll f >>= \vs -> return $ v : vs
+pullAll (YieldT i)  = i >>= \f -> pullAll f
+
 -- pipes and streams
 
 data StreamState s m = CR (CoroutineT s m (StreamState s m))
@@ -83,4 +88,5 @@ identityPipe = do x <- pullPipe
                       Just v -> pushPipe v >> identityPipe
                       Nothing -> return ()
 
-
+pullAllPipe :: (Monad m) => StreamT s m () -> m [s]
+pullAllPipe f = pullAll (return NoCR |> f)

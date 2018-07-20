@@ -34,9 +34,12 @@ tokenp = lnToken (some (oneOfL "0123456789"))
        <|> acceptL "->"
        <|> acceptL "=>"
        <|> acceptL ".."
+       <|> acceptL "</"
+       <|> acceptL "/>"
+       <|> acceptL "</>"
        <|> regexp
        <|> quotep
-       <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#+-*/")
+       <|> (((:"")<$>) <$> oneOfL "=()|.,;$:#+-*/<>")
 
 quotep :: TParser (LNToken String)
 quotep = acceptL "\"" *>
@@ -57,6 +60,7 @@ data PExpr
     = PIdent String
     | PString String
     | PInteger Integer
+    | PObject String (M.Map String PExpr) [PExpr]
     | PCall String [PExpr]
     | PPipe PExpr PExpr
     | PFor [(PPattern, PExpr)]
@@ -69,6 +73,7 @@ instance Show PExpr where
     show (PIdent s) = s
     show (PString s) = show s
     show (PInteger i) = show i
+    show (PObject t m l) = showObj t m l show
     show (PCall s es) = s ++ "(" ++ intercalate ", " (map show es) ++ ")"
     show (PPipe a b) = show a ++ " | " ++ show b
     show (PFor ps) = intercalate " " $ map (\(p, e) -> show p ++ " => (" ++ show e ++ ")") ps
@@ -76,6 +81,14 @@ instance Show PExpr where
     show (PLet pp a b) = show pp ++ " = " ++ show a ++ "; " ++ show b
     show (PBlock es) = intercalate "; " $ map show es
     show PEmpty = "()"
+
+showObj :: String -> (M.Map String t) -> [t] -> (t -> String) -> String
+showObj t m l showChild =
+    "<" ++ t
+    ++ concatMap (\(k, v) -> " " ++ k ++ "=" ++ showChild v) (M.toList m)
+    ++ case length l of
+        0 -> "/>"
+        _ -> ">" ++ concatMap showChild l ++ "</" ++ t ++ ">"
 
 data PPattern
     = PPVar String PPattern
@@ -91,7 +104,7 @@ instance Show PPattern where
     show (PPRegex s) = ":/../"
     show PPAnyString = "$"
     show PPAnyInt = "#"
-    show PPAny = ""
+    show PPAny = "."
 
 type PParser r = ParserT (LNToken String) Identity r
 
@@ -127,7 +140,7 @@ factorp :: PParser PExpr
 factorp = operatorp ["*", "/"] simplep
 
 simplep :: PParser PExpr
-simplep = callp <|> forp <|> pullp <|> letp <|> intp <|> identp <|> parentp <|> stringp <|> emptyp <|> lenp
+simplep = callp <|> forp <|> pullp <|> letp <|> intp <|> identp <|> parentp <|> stringp <|> objectp <|> emptyp <|> lenp
 
 identp :: PParser PExpr
 identp = PIdent <$> identifierL
@@ -143,6 +156,17 @@ intp = do s <- nextToken
           unless (all (`elem` "0123456789") (content s)) $
               parsingError s "int token"
           return . PInteger . read $ content s
+
+objectp :: PParser PExpr
+objectp = do acceptL ["<"]
+             tag <- identifierL
+             keyvals <- M.fromList <$> many keyvalp
+             vals <- (acceptL ["/>"] *> pure [])
+                     <|> (acceptL [">"] *> many simplep <* (acceptL ["</>"] <|> (acceptL ["</"] *> acceptL [tag] *> acceptL [">"])))
+             return $ PObject tag keyvals vals
+
+keyvalp :: PParser (String, PExpr)
+keyvalp = (,) <$> identifierL <*> (acceptL ["="] *> simplep)
 
 lenp :: PParser PExpr
 lenp = PCall "#" . pure <$> (acceptL ["#"] *> simplep)
@@ -194,7 +218,7 @@ anyintpp :: PParser PPattern
 anyintpp = acceptL ["#"] >> return PPAnyInt
 
 anypp :: PParser PPattern
-anypp = acceptL ["(", ")"] >> return PPAny
+anypp = acceptL ["."] >> return PPAny
 
 parentpp :: PParser PPattern
 parentpp = (acceptL ["("] *> patternp) <* acceptL [")"]
@@ -215,28 +239,40 @@ parsePuna code = do tokens <- lexPuna code
 
 -- Compiler
 
-data PunaValue = PVStr String | PVInt Integer
+data PunaValue
+    = PVStr String
+    | PVInt Integer
+    | PVObj String (M.Map String PunaValue) [PunaValue]
 
 toString :: PunaValue -> String
 toString (PVStr s) = s
 toString (PVInt i) = show i
+toString (PVObj t m l) = showObj t m l toString
 
 toInt :: PunaValue -> Integer
 toInt (PVStr s) = read s
 toInt (PVInt i) = i
-
+toInt (PVObj _ _ _) = error "can't convert object to integer"
 type PunaScope = M.Map String PunaValue
 
 type PunaFunc = PunaScope -> StreamT PunaValue IO ()
 
 eval :: PExpr -> PunaScope -> (PunaValue -> StreamT PunaValue IO ()) -> StreamT PunaValue IO ()
 eval expr scope g = pipePipe [compile expr scope, pullPipe >>= \v -> case v of Just v' -> g v'
-                                                                               Nothing -> error $ show expr ++ " evaluated to nothing" ]
+                                                                               Nothing -> error $ "stream is empty: " ++ show expr ++ " evaluated to nothing" ]
+
+expectOne :: [PunaValue] -> PunaValue
+expectOne [x] = x
+expectOne []  = error "stream is empty"
+expectOne _   = error "stream is full"
 
 compile :: PExpr -> PunaFunc
 compile PEmpty           scope = return ()
 compile (PString string) scope = pushPipe $ PVStr string
 compile (PInteger int)   scope = pushPipe $ PVInt int
+compile (PObject t m l)  scope = do m' <- lift . lift $ fmap expectOne <$> mapM (pullAllPipe . flip compile scope) m
+                                    l' <- lift . lift $ concat <$> mapM (pullAllPipe . flip compile scope) l
+                                    pushPipe $ PVObj t m' l'
 compile (PIdent ident)   scope = pushPipe . fromJust $ M.lookup ident scope <|> Just (PVStr "")
 compile (PPipe e1 e2)    scope = pipePipe [compile e1 scope, compile e2 scope]
 
@@ -265,7 +301,7 @@ compile (PLet pattern val expr) scope
 
 compile (PBlock exprs) scope
     = let (v:vs) = ($ scope) <$> map compile exprs
-      in foldr (>>) v vs
+      in foldl (>>) v vs
 
 compile (PCall ".." [a, b]) scope = binaryPvOp scope a b toString PVStr (++)
 compile (PCall "+" [a, b])  scope = binaryPvOp scope a b toInt PVInt (+)
